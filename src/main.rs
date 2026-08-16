@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use asus_copilot_meta2::CopilotFilter;
-use evdev::{AttributeSet, Device, KeyCode, uinput::VirtualDevice};
+use evdev::{AttributeSet, Device, KeyCode, RelativeAxisCode, uinput::VirtualDevice};
 use std::{env, path::PathBuf};
 
 const DEFAULT_DEVICE: &str = "/dev/input/by-path/platform-i8042-serio-0-event-kbd";
@@ -60,10 +60,19 @@ fn run(path: Option<PathBuf>) -> Result<()> {
         .collect();
     keys.insert(KeyCode::KEY_F24);
 
-    let mut output = VirtualDevice::builder()
+    let mut keyboard = VirtualDevice::builder()
         .context("cannot open /dev/uinput")?
         .name("ASUS Copilot Meta2 Keyboard")
         .with_keys(&keys)?
+        .build()?;
+
+    let pointer_buttons = AttributeSet::from_iter([KeyCode::BTN_LEFT, KeyCode::BTN_RIGHT]);
+    let pointer_axes = AttributeSet::from_iter([RelativeAxisCode::REL_X, RelativeAxisCode::REL_Y]);
+    let mut pointer = VirtualDevice::builder()
+        .context("cannot open /dev/uinput for pointer")?
+        .name("ASUS Meta Pointer")
+        .with_keys(&pointer_buttons)?
+        .with_relative_axes(&pointer_axes)?
         .build()?;
 
     source
@@ -78,8 +87,11 @@ fn run(path: Option<PathBuf>) -> Result<()> {
     loop {
         let frame: Vec<_> = source.fetch_events()?.collect();
         let filtered = filter.frame(frame);
-        if !filtered.is_empty() {
-            output.emit(&filtered)?;
+        if !filtered.keyboard.is_empty() {
+            keyboard.emit(&filtered.keyboard)?;
+        }
+        if !filtered.pointer.is_empty() {
+            pointer.emit(&filtered.pointer)?;
         }
     }
 }

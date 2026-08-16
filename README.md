@@ -6,6 +6,17 @@ key as `Left Meta + Left Shift + F23`; the daemon removes this synthetic chord
 and emits `F24`, while the supplied XKB keymap maps `F24` to
 `ISO_Level5_Shift` (`Mod3`). Think of it as a second Super key — **Meta2**.
 
+On the configured laptop the same input proxy also provides reliable keyboard
+pointer buttons before events reach the compositor:
+
+- `Super+J` is a holdable left button (tap, double-click and drag);
+- `Super+K` is a holdable right button.
+
+These combinations suppress Super at the physical input boundary and emit
+buttons through a separate virtual pointer. They never synthesize a Super
+release on an unrelated device, so quick presses and either key-release order
+remain balanced.
+
 The implementation is a small optimized Rust daemon. It uses `EVIOCGRAB` on
 the built-in keyboard and mirrors every normal key through `/dev/uinput`.
 Stopping or crashing the process closes the file descriptor, so the kernel
