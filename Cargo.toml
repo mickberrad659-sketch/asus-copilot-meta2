@@ -1,0 +1,18 @@
+[package]
+name = "asus-copilot-meta2"
+version = "0.1.0"
+edition = "2024"
+description = "Turn the ASUS Copilot key into an independent Meta2 modifier"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+evdev = "0.13"
+libc = "0.2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+

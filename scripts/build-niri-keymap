@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+output=${1:-"$HOME/.config/niri/asus-meta2.xkb"}
+layout=${ASUS_META2_LAYOUT:-us,ru}
+options=${ASUS_META2_OPTIONS:-grp:caps_toggle}
+temporary=$(mktemp)
+trap 'rm -f "$temporary"' EXIT
+
+xkbcli compile-keymap --layout "$layout" --options "$options" > "$temporary"
+mkdir -p "$(dirname -- "$output")"
+awk '
+  /modifier_map Shift/ && !done {
+    print "\tkey <FK24> { [ ISO_Level5_Shift ] };"
+    print "\tmodifier_map Mod3 { <FK24> };"
+    done=1
+  }
+  { print }
+  END { if (!done) exit 42 }
+' "$temporary" > "$output"
+
+printf 'Generated %s\n' "$output"
