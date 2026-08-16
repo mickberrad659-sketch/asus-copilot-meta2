@@ -57,9 +57,6 @@ impl CopilotFilter {
             }
         }
 
-        if !self.copilot_held {
-            output.append(&mut self.pending);
-        }
         output
     }
 }
@@ -86,10 +83,33 @@ mod tests {
     }
 
     #[test]
+    fn replaces_copilot_chord_split_across_kernel_frames() {
+        let mut filter = CopilotFilter::default();
+        assert!(filter.frame([key(META, 1)]).is_empty());
+        assert!(filter.frame([key(SHIFT, 1)]).is_empty());
+        assert_eq!(codes(&filter.frame([key(F23, 1)])), [(F24, 1)]);
+        assert_eq!(codes(&filter.frame([key(F23, 0)])), [(F24, 0)]);
+        assert!(filter.frame([key(SHIFT, 0)]).is_empty());
+        assert!(filter.frame([key(META, 0)]).is_empty());
+    }
+
+    #[test]
     fn ordinary_shortcuts_are_unchanged() {
         let mut filter = CopilotFilter::default();
         let events = [key(META, 1), key(SHIFT, 1), key(KeyCode::KEY_A.code(), 1)];
         assert_eq!(codes(&filter.frame(events)), codes(&events));
+    }
+
+    #[test]
+    fn ordinary_shortcut_split_across_frames_is_unchanged() {
+        let mut filter = CopilotFilter::default();
+        assert!(filter.frame([key(META, 1)]).is_empty());
+        assert!(filter.frame([key(SHIFT, 1)]).is_empty());
+        let a = key(KeyCode::KEY_A.code(), 1);
+        assert_eq!(
+            codes(&filter.frame([a])),
+            [(META, 1), (SHIFT, 1), (KeyCode::KEY_A.code(), 1)]
+        );
     }
 
     #[test]
