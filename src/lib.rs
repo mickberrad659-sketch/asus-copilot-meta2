@@ -13,8 +13,7 @@ enum Active {
     None,
     Copilot,
     Pointer {
-        trigger: u16,
-        button: u16,
+        held: Option<(u16, u16)>,
         meta_down: bool,
     },
 }
@@ -55,28 +54,34 @@ impl CopilotFilter {
                     }
                     continue;
                 }
-                Active::Pointer {
-                    trigger,
-                    button,
-                    meta_down,
-                } => {
-                    if code == *trigger {
-                        if value == 0 {
-                            output.pointer.push(key(*button, 0));
-                            if *meta_down {
-                                // Restore the still-physically-held modifier on the same
-                                // virtual keyboard that normally emits it. Its later physical
-                                // release will therefore remain perfectly balanced.
-                                output.keyboard.push(key(META, 1));
-                            }
-                            self.active = Active::None;
-                        }
-                    } else if code == META {
+                Active::Pointer { held, meta_down } => {
+                    if code == META {
                         if value == 0 {
                             *meta_down = false;
+                            if held.is_none() {
+                                self.active = Active::None;
+                            }
                         }
+                    } else if let Some((trigger, button)) = *held {
+                        if code == trigger && value == 0 {
+                            output.pointer.push(key(button, 0));
+                            *held = None;
+                            if !*meta_down {
+                                self.active = Active::None;
+                            }
+                        } else if code != trigger {
+                            output.keyboard.push(event);
+                        }
+                    } else if (code == J || code == K) && value == 1 {
+                        let button = pointer_button(code);
+                        *held = Some((code, button));
+                        output.pointer.push(key(button, 1));
                     } else {
+                        if *meta_down {
+                            output.keyboard.push(key(META, 1));
+                        }
                         output.keyboard.push(event);
+                        self.active = Active::None;
                     }
                     continue;
                 }
@@ -89,15 +94,10 @@ impl CopilotFilter {
                     self.pending.push(event)
                 }
                 [meta] if meta.code() == META && (code == J || code == K) && value == 1 => {
-                    let button = if code == J {
-                        KeyCode::BTN_LEFT.code()
-                    } else {
-                        KeyCode::BTN_RIGHT.code()
-                    };
+                    let button = pointer_button(code);
                     self.pending.clear();
                     self.active = Active::Pointer {
-                        trigger: code,
-                        button,
+                        held: Some((code, button)),
                         meta_down: true,
                     };
                     output.pointer.push(key(button, 1));
@@ -125,6 +125,14 @@ impl CopilotFilter {
 
 fn key(code: u16, value: i32) -> InputEvent {
     InputEvent::new(EventType::KEY.0, code, value)
+}
+
+fn pointer_button(trigger: u16) -> u16 {
+    if trigger == J {
+        KeyCode::BTN_LEFT.code()
+    } else {
+        KeyCode::BTN_RIGHT.code()
+    }
 }
 
 #[cfg(test)]
@@ -167,8 +175,8 @@ mod tests {
 
         let up = filter.frame([key(J, 0)]);
         assert_eq!(codes(&up.pointer), [(KeyCode::BTN_LEFT.code(), 0)]);
-        assert_eq!(codes(&up.keyboard), [(META, 1)]);
-        assert_eq!(codes(&filter.frame([key(META, 0)]).keyboard), [(META, 0)]);
+        assert!(up.keyboard.is_empty());
+        assert!(filter.frame([key(META, 0)]).keyboard.is_empty());
     }
 
     #[test]
@@ -192,7 +200,39 @@ mod tests {
         assert_eq!(codes(&down.pointer), [(KeyCode::BTN_RIGHT.code(), 1)]);
         let up = filter.frame([key(K, 0), key(META, 0)]);
         assert_eq!(codes(&up.pointer), [(KeyCode::BTN_RIGHT.code(), 0)]);
-        assert_eq!(codes(&up.keyboard), [(META, 1), (META, 0)]);
+        assert!(up.keyboard.is_empty());
+    }
+
+    #[test]
+    fn repeated_j_presses_remain_clicks_until_super_is_released() {
+        let mut filter = CopilotFilter::default();
+        filter.frame([key(META, 1)]);
+        let first_down = filter.frame([key(J, 1)]);
+        let first_up = filter.frame([key(J, 0)]);
+        let second_down = filter.frame([key(J, 1)]);
+        let second_up = filter.frame([key(J, 0)]);
+        let meta_up = filter.frame([key(META, 0)]);
+
+        assert_eq!(codes(&first_down.pointer), [(KeyCode::BTN_LEFT.code(), 1)]);
+        assert_eq!(codes(&first_up.pointer), [(KeyCode::BTN_LEFT.code(), 0)]);
+        assert_eq!(codes(&second_down.pointer), [(KeyCode::BTN_LEFT.code(), 1)]);
+        assert_eq!(codes(&second_up.pointer), [(KeyCode::BTN_LEFT.code(), 0)]);
+        assert!(first_down.keyboard.is_empty());
+        assert!(first_up.keyboard.is_empty());
+        assert!(second_down.keyboard.is_empty());
+        assert!(second_up.keyboard.is_empty());
+        assert!(meta_up.keyboard.is_empty());
+    }
+
+    #[test]
+    fn another_key_after_click_restores_an_ordinary_super_shortcut() {
+        let mut filter = CopilotFilter::default();
+        filter.frame([key(META, 1)]);
+        filter.frame([key(J, 1)]);
+        filter.frame([key(J, 0)]);
+        let a = filter.frame([key(KeyCode::KEY_A.code(), 1)]);
+        assert_eq!(codes(&a.keyboard), [(META, 1), (KeyCode::KEY_A.code(), 1)]);
+        assert_eq!(codes(&filter.frame([key(META, 0)]).keyboard), [(META, 0)]);
     }
 
     #[test]
