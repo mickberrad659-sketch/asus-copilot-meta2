@@ -1,9 +1,19 @@
 use anyhow::{Context, Result, bail};
 use asus_copilot_meta2::CopilotFilter;
-use evdev::{AttributeSet, Device, KeyCode, RelativeAxisCode, uinput::VirtualDevice};
-use std::{env, path::PathBuf};
+use evdev::{
+    AttributeSet, Device, EventType, KeyCode, RelativeAxisCode, UinputAbsSetup,
+    uinput::VirtualDevice,
+};
+use std::{
+    env,
+    os::fd::AsRawFd,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 const DEFAULT_DEVICE: &str = "/dev/input/by-path/platform-i8042-serio-0-event-kbd";
+const TOUCHPAD_NAME: &str = "ASUF1209:00 2808:0219 Touchpad";
+const CLICK_GUARD: Duration = Duration::from_millis(250);
 
 fn main() -> Result<()> {
     let mut args = env::args().skip(1);
@@ -75,23 +85,161 @@ fn run(path: Option<PathBuf>) -> Result<()> {
         .with_relative_axes(&pointer_axes)?
         .build()?;
 
+    let touchpad_path = find_touchpad()?;
+    let mut touchpad_source = Device::open(&touchpad_path)
+        .with_context(|| format!("cannot open {}", touchpad_path.display()))?;
+    let mut touchpad = clone_touchpad(&touchpad_source)?;
+
     source
         .grab()
         .with_context(|| format!("cannot grab {}", path.display()))?;
+    touchpad_source
+        .grab()
+        .with_context(|| format!("cannot grab {}", touchpad_path.display()))?;
+    source.set_nonblocking(true)?;
+    touchpad_source.set_nonblocking(true)?;
     eprintln!(
-        "remapping ASUS Copilot key from {}; stop the process to release the keyboard",
-        path.display()
+        "remapping keyboard {} and guarding touchpad clicks from {} ({} ms)",
+        path.display(),
+        touchpad_path.display(),
+        CLICK_GUARD.as_millis()
     );
 
     let mut filter = CopilotFilter::default();
+    let mut last_typing: Option<Instant> = None;
+    let mut meta_down = false;
+    let mut suppressed_left = false;
+    let mut suppressed_touch = false;
     loop {
-        let frame: Vec<_> = source.fetch_events()?.collect();
-        let filtered = filter.frame(frame);
-        if !filtered.keyboard.is_empty() {
-            keyboard.emit(&filtered.keyboard)?;
+        let mut fds = [
+            libc::pollfd {
+                fd: source.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: touchpad_source.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+        if ready < 0 {
+            return Err(std::io::Error::last_os_error()).context("polling input devices");
         }
-        if !filtered.pointer.is_empty() {
-            pointer.emit(&filtered.pointer)?;
+
+        if fds[0].revents & libc::POLLIN != 0 {
+            let frame: Vec<_> = source.fetch_events()?.collect();
+            for event in &frame {
+                if event.event_type() != EventType::KEY {
+                    continue;
+                }
+                if event.code() == KeyCode::KEY_LEFTMETA.code() {
+                    meta_down = event.value() != 0;
+                    continue;
+                }
+                if event.value() == 1 || event.value() == 2 {
+                    let modifier = matches!(event.code(),
+                        x if x == KeyCode::KEY_LEFTSHIFT.code()
+                          || x == KeyCode::KEY_RIGHTSHIFT.code()
+                          || x == KeyCode::KEY_LEFTCTRL.code()
+                          || x == KeyCode::KEY_RIGHTCTRL.code()
+                          || x == KeyCode::KEY_LEFTALT.code()
+                          || x == KeyCode::KEY_RIGHTALT.code()
+                          || x == KeyCode::KEY_RIGHTMETA.code());
+                    let meta_pointer = meta_down
+                        && matches!(event.code(),
+                        x if x == KeyCode::KEY_J.code() || x == KeyCode::KEY_K.code());
+                    if !modifier && !meta_pointer {
+                        last_typing = Some(Instant::now());
+                    }
+                }
+            }
+            let filtered = filter.frame(frame);
+            if !filtered.keyboard.is_empty() {
+                keyboard.emit(&filtered.keyboard)?;
+            }
+            if !filtered.pointer.is_empty() {
+                pointer.emit(&filtered.pointer)?;
+            }
+        }
+
+        if fds[1].revents & libc::POLLIN != 0 {
+            let guarded = last_typing.is_some_and(|at| at.elapsed() < CLICK_GUARD);
+            let raw: Vec<_> = touchpad_source
+                .fetch_events()?
+                .filter(|event| {
+                    event.event_type() != EventType::SYNCHRONIZATION
+                        && event.event_type() != EventType::MISC
+                })
+                .collect();
+            let touch_down = raw.iter().any(|event| {
+                event.event_type() == EventType::KEY
+                    && event.code() == KeyCode::BTN_TOUCH.code()
+                    && event.value() == 1
+            });
+            let touch_up = raw.iter().any(|event| {
+                event.event_type() == EventType::KEY
+                    && event.code() == KeyCode::BTN_TOUCH.code()
+                    && event.value() == 0
+            });
+            if guarded && touch_down {
+                suppressed_touch = true;
+            }
+            // Drop the whole contact frame, including the tracking-id event
+            // that often arrives before BTN_TOUCH in the same kernel frame.
+            if suppressed_touch {
+                if touch_up {
+                    suppressed_touch = false;
+                }
+                continue;
+            }
+
+            let mut frame = Vec::new();
+            for event in raw {
+                if event.event_type() == EventType::KEY && event.code() == KeyCode::BTN_LEFT.code()
+                {
+                    if event.value() == 1 && guarded {
+                        suppressed_left = true;
+                        continue;
+                    }
+                    if event.value() == 0 && suppressed_left {
+                        suppressed_left = false;
+                        continue;
+                    }
+                }
+                frame.push(event);
+            }
+            if !frame.is_empty() {
+                touchpad.emit(&frame)?;
+            }
         }
     }
+}
+
+fn find_touchpad() -> Result<PathBuf> {
+    for index in 0..64 {
+        let path = PathBuf::from(format!("/dev/input/event{index}"));
+        let Ok(device) = Device::open(&path) else {
+            continue;
+        };
+        if device.name() == Some(TOUCHPAD_NAME) {
+            return Ok(path);
+        }
+    }
+    bail!("cannot find touchpad named {TOUCHPAD_NAME}")
+}
+
+fn clone_touchpad(source: &Device) -> Result<VirtualDevice> {
+    let mut builder = VirtualDevice::builder()?
+        .name("ASUS Filtered Touchpad")
+        .input_id(source.input_id())
+        .with_properties(source.properties())?;
+    if let Some(keys) = source.supported_keys() {
+        builder = builder.with_keys(keys)?;
+    }
+    for (axis, info) in source.get_absinfo()? {
+        builder = builder.with_absolute_axis(&UinputAbsSetup::new(axis, info))?;
+    }
+    builder.build().context("creating filtered touchpad")
 }
