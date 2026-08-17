@@ -15,6 +15,7 @@ use std::{
 const DEFAULT_DEVICE: &str = "/dev/input/by-path/platform-i8042-serio-0-event-kbd";
 const TOUCHPAD_NAME: &str = "ASUF1209:00 2808:0219 Touchpad";
 const CLICK_GUARD: Duration = Duration::from_millis(250);
+const MT_TOOL_FINGER: i32 = 0;
 const MT_TOOL_PALM: i32 = 2;
 
 fn main() -> Result<()> {
@@ -227,13 +228,18 @@ impl TouchpadGuard {
                         self.palm_slots.insert(self.current_slot);
                     }
                     frame.push(event);
-                    if self.palm_slots.contains(&self.current_slot) {
-                        frame.push(InputEvent::new(
-                            EventType::ABSOLUTE.0,
-                            tool_type,
-                            MT_TOOL_PALM,
-                        ));
-                    }
+                    let contact_type = if self.palm_slots.contains(&self.current_slot) {
+                        MT_TOOL_PALM
+                    } else {
+                        // MT_TOOL_TYPE is slot state and survives tracking-id
+                        // changes. Explicitly reset a reused slot to FINGER.
+                        MT_TOOL_FINGER
+                    };
+                    frame.push(InputEvent::new(
+                        EventType::ABSOLUTE.0,
+                        tool_type,
+                        contact_type,
+                    ));
                 } else {
                     frame.push(event);
                     self.palm_slots.remove(&self.current_slot);
@@ -302,7 +308,21 @@ mod touchpad_tests {
             abs(AbsoluteAxisCode::ABS_MT_TRACKING_ID, 7),
             abs(AbsoluteAxisCode::ABS_MT_POSITION_X, 1234),
         ];
-        assert_eq!(guard.frame(raw.clone(), false), raw);
+        let output = guard.frame(raw.clone(), false);
+        assert_eq!(&output[..2], &raw[..2]);
+        assert_eq!(output[2].code(), AbsoluteAxisCode::ABS_MT_TOOL_TYPE.0);
+        assert_eq!(output[2].value(), MT_TOOL_FINGER);
+        assert_eq!(output[3], raw[2]);
+    }
+
+    #[test]
+    fn slot_is_reset_to_finger_after_a_guarded_palm_contact() {
+        let mut guard = TouchpadGuard::default();
+        guard.frame(vec![abs(AbsoluteAxisCode::ABS_MT_TRACKING_ID, 1)], true);
+        guard.frame(vec![abs(AbsoluteAxisCode::ABS_MT_TRACKING_ID, -1)], false);
+        let next = guard.frame(vec![abs(AbsoluteAxisCode::ABS_MT_TRACKING_ID, 2)], false);
+        assert_eq!(next[1].code(), AbsoluteAxisCode::ABS_MT_TOOL_TYPE.0);
+        assert_eq!(next[1].value(), MT_TOOL_FINGER);
     }
 
     #[test]
