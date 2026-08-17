@@ -1,10 +1,11 @@
 use anyhow::{Context, Result, bail};
 use asus_copilot_meta2::CopilotFilter;
 use evdev::{
-    AttributeSet, Device, EventType, KeyCode, RelativeAxisCode, UinputAbsSetup,
-    uinput::VirtualDevice,
+    AbsoluteAxisCode, AttributeSet, Device, EventType, InputEvent, KeyCode, RelativeAxisCode,
+    UinputAbsSetup, uinput::VirtualDevice,
 };
 use std::{
+    collections::HashSet,
     env,
     os::fd::AsRawFd,
     path::PathBuf,
@@ -14,6 +15,7 @@ use std::{
 const DEFAULT_DEVICE: &str = "/dev/input/by-path/platform-i8042-serio-0-event-kbd";
 const TOUCHPAD_NAME: &str = "ASUF1209:00 2808:0219 Touchpad";
 const CLICK_GUARD: Duration = Duration::from_millis(250);
+const MT_TOOL_PALM: i32 = 2;
 
 fn main() -> Result<()> {
     let mut args = env::args().skip(1);
@@ -108,7 +110,7 @@ fn run(path: Option<PathBuf>) -> Result<()> {
     let mut filter = CopilotFilter::default();
     let mut last_typing: Option<Instant> = None;
     let mut meta_down = false;
-    let mut suppressed_left = false;
+    let mut touchpad_guard = TouchpadGuard::default();
     let mut touchpad_frame = Vec::new();
     loop {
         let mut fds = [
@@ -173,7 +175,7 @@ fn run(path: Option<PathBuf>) -> Result<()> {
                             &mut touchpad,
                             std::mem::take(&mut touchpad_frame),
                             guarded,
-                            &mut suppressed_left,
+                            &mut touchpad_guard,
                         )?;
                     }
                 } else if event.event_type() != EventType::MISC {
@@ -188,26 +190,129 @@ fn forward_touchpad_frame(
     touchpad: &mut VirtualDevice,
     raw: Vec<evdev::InputEvent>,
     guarded: bool,
-    suppressed_left: &mut bool,
+    guard: &mut TouchpadGuard,
 ) -> Result<()> {
-    let mut frame = Vec::new();
-    for event in raw {
-        if event.event_type() == EventType::KEY && event.code() == KeyCode::BTN_LEFT.code() {
-            if event.value() == 1 && guarded {
-                *suppressed_left = true;
-                continue;
-            }
-            if event.value() == 0 && *suppressed_left {
-                *suppressed_left = false;
-                continue;
-            }
-        }
-        frame.push(event);
-    }
+    let frame = guard.frame(raw, guarded);
     if !frame.is_empty() {
         touchpad.emit(&frame)?;
     }
     Ok(())
+}
+
+#[derive(Default)]
+struct TouchpadGuard {
+    current_slot: i32,
+    palm_slots: HashSet<i32>,
+    suppressed_left: bool,
+}
+
+impl TouchpadGuard {
+    fn frame(&mut self, raw: Vec<InputEvent>, guarded: bool) -> Vec<InputEvent> {
+        let mut frame = Vec::with_capacity(raw.len() + 2);
+        let slot = AbsoluteAxisCode::ABS_MT_SLOT.0;
+        let tracking_id = AbsoluteAxisCode::ABS_MT_TRACKING_ID.0;
+        let tool_type = AbsoluteAxisCode::ABS_MT_TOOL_TYPE.0;
+
+        for event in raw {
+            if event.event_type() == EventType::ABSOLUTE && event.code() == slot {
+                self.current_slot = event.value();
+                frame.push(event);
+                continue;
+            }
+            if event.event_type() == EventType::ABSOLUTE && event.code() == tracking_id {
+                if event.value() >= 0 {
+                    // Keep a whole multi-finger gesture inhibited when its
+                    // first contact began inside the 250 ms guard window.
+                    if guarded || !self.palm_slots.is_empty() {
+                        self.palm_slots.insert(self.current_slot);
+                    }
+                    frame.push(event);
+                    if self.palm_slots.contains(&self.current_slot) {
+                        frame.push(InputEvent::new(
+                            EventType::ABSOLUTE.0,
+                            tool_type,
+                            MT_TOOL_PALM,
+                        ));
+                    }
+                } else {
+                    frame.push(event);
+                    self.palm_slots.remove(&self.current_slot);
+                }
+                continue;
+            }
+            if event.event_type() == EventType::ABSOLUTE
+                && event.code() == tool_type
+                && self.palm_slots.contains(&self.current_slot)
+            {
+                frame.push(InputEvent::new(
+                    EventType::ABSOLUTE.0,
+                    tool_type,
+                    MT_TOOL_PALM,
+                ));
+                continue;
+            }
+            if event.event_type() == EventType::KEY && event.code() == KeyCode::BTN_LEFT.code() {
+                if event.value() == 1 && guarded {
+                    self.suppressed_left = true;
+                    continue;
+                }
+                if event.value() == 0 && self.suppressed_left {
+                    self.suppressed_left = false;
+                    continue;
+                }
+            }
+            frame.push(event);
+        }
+        frame
+    }
+}
+
+#[cfg(test)]
+mod touchpad_tests {
+    use super::*;
+
+    fn abs(code: AbsoluteAxisCode, value: i32) -> InputEvent {
+        InputEvent::new(EventType::ABSOLUTE.0, code.0, value)
+    }
+
+    #[test]
+    fn guarded_contact_is_marked_as_palm_but_release_is_preserved() {
+        let mut guard = TouchpadGuard::default();
+        let down = guard.frame(
+            vec![
+                abs(AbsoluteAxisCode::ABS_MT_SLOT, 0),
+                abs(AbsoluteAxisCode::ABS_MT_TRACKING_ID, 42),
+            ],
+            true,
+        );
+        assert_eq!(down.len(), 3);
+        assert_eq!(down[2].code(), AbsoluteAxisCode::ABS_MT_TOOL_TYPE.0);
+        assert_eq!(down[2].value(), MT_TOOL_PALM);
+
+        let up = guard.frame(vec![abs(AbsoluteAxisCode::ABS_MT_TRACKING_ID, -1)], false);
+        assert_eq!(up.len(), 1);
+        assert!(guard.palm_slots.is_empty());
+    }
+
+    #[test]
+    fn ordinary_multitouch_frames_are_byte_for_byte_unchanged() {
+        let mut guard = TouchpadGuard::default();
+        let raw = vec![
+            abs(AbsoluteAxisCode::ABS_MT_SLOT, 1),
+            abs(AbsoluteAxisCode::ABS_MT_TRACKING_ID, 7),
+            abs(AbsoluteAxisCode::ABS_MT_POSITION_X, 1234),
+        ];
+        assert_eq!(guard.frame(raw.clone(), false), raw);
+    }
+
+    #[test]
+    fn physical_click_press_and_release_are_suppressed_as_a_pair() {
+        let mut guard = TouchpadGuard::default();
+        let down = InputEvent::new(EventType::KEY.0, KeyCode::BTN_LEFT.code(), 1);
+        let up = InputEvent::new(EventType::KEY.0, KeyCode::BTN_LEFT.code(), 0);
+        assert!(guard.frame(vec![down], true).is_empty());
+        assert!(guard.frame(vec![up], false).is_empty());
+    }
 }
 
 fn find_touchpad() -> Result<PathBuf> {
