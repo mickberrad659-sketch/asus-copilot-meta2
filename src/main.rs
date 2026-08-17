@@ -109,7 +109,7 @@ fn run(path: Option<PathBuf>) -> Result<()> {
     let mut last_typing: Option<Instant> = None;
     let mut meta_down = false;
     let mut suppressed_left = false;
-    let mut suppressed_touch = false;
+    let mut touchpad_frame = Vec::new();
     loop {
         let mut fds = [
             libc::pollfd {
@@ -166,55 +166,48 @@ fn run(path: Option<PathBuf>) -> Result<()> {
 
         if fds[1].revents & libc::POLLIN != 0 {
             let guarded = last_typing.is_some_and(|at| at.elapsed() < CLICK_GUARD);
-            let raw: Vec<_> = touchpad_source
-                .fetch_events()?
-                .filter(|event| {
-                    event.event_type() != EventType::SYNCHRONIZATION
-                        && event.event_type() != EventType::MISC
-                })
-                .collect();
-            let touch_down = raw.iter().any(|event| {
-                event.event_type() == EventType::KEY
-                    && event.code() == KeyCode::BTN_TOUCH.code()
-                    && event.value() == 1
-            });
-            let touch_up = raw.iter().any(|event| {
-                event.event_type() == EventType::KEY
-                    && event.code() == KeyCode::BTN_TOUCH.code()
-                    && event.value() == 0
-            });
-            if guarded && touch_down {
-                suppressed_touch = true;
-            }
-            // Drop the whole contact frame, including the tracking-id event
-            // that often arrives before BTN_TOUCH in the same kernel frame.
-            if suppressed_touch {
-                if touch_up {
-                    suppressed_touch = false;
-                }
-                continue;
-            }
-
-            let mut frame = Vec::new();
-            for event in raw {
-                if event.event_type() == EventType::KEY && event.code() == KeyCode::BTN_LEFT.code()
-                {
-                    if event.value() == 1 && guarded {
-                        suppressed_left = true;
-                        continue;
+            for event in touchpad_source.fetch_events()? {
+                if event.event_type() == EventType::SYNCHRONIZATION {
+                    if event.code() == 0 {
+                        forward_touchpad_frame(
+                            &mut touchpad,
+                            std::mem::take(&mut touchpad_frame),
+                            guarded,
+                            &mut suppressed_left,
+                        )?;
                     }
-                    if event.value() == 0 && suppressed_left {
-                        suppressed_left = false;
-                        continue;
-                    }
+                } else if event.event_type() != EventType::MISC {
+                    touchpad_frame.push(event);
                 }
-                frame.push(event);
-            }
-            if !frame.is_empty() {
-                touchpad.emit(&frame)?;
             }
         }
     }
+}
+
+fn forward_touchpad_frame(
+    touchpad: &mut VirtualDevice,
+    raw: Vec<evdev::InputEvent>,
+    guarded: bool,
+    suppressed_left: &mut bool,
+) -> Result<()> {
+    let mut frame = Vec::new();
+    for event in raw {
+        if event.event_type() == EventType::KEY && event.code() == KeyCode::BTN_LEFT.code() {
+            if event.value() == 1 && guarded {
+                *suppressed_left = true;
+                continue;
+            }
+            if event.value() == 0 && *suppressed_left {
+                *suppressed_left = false;
+                continue;
+            }
+        }
+        frame.push(event);
+    }
+    if !frame.is_empty() {
+        touchpad.emit(&frame)?;
+    }
+    Ok(())
 }
 
 fn find_touchpad() -> Result<PathBuf> {
