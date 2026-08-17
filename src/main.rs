@@ -1,14 +1,15 @@
 use anyhow::{Context, Result, bail};
 use asus_copilot_meta2::CopilotFilter;
 use evdev::{
-    AbsoluteAxisCode, AttributeSet, Device, EventType, InputEvent, KeyCode, RelativeAxisCode,
-    UinputAbsSetup, uinput::VirtualDevice,
+    AbsoluteAxisCode, AttributeSet, Device, EventType, InputEvent, KeyCode, LedCode,
+    RelativeAxisCode, UinputAbsSetup, uinput::VirtualDevice,
 };
 use std::{
     collections::HashSet,
     env,
     os::fd::AsRawFd,
     path::PathBuf,
+    process::Command,
     time::{Duration, Instant},
 };
 
@@ -101,6 +102,8 @@ fn run(path: Option<PathBuf>) -> Result<()> {
         .with_context(|| format!("cannot grab {}", touchpad_path.display()))?;
     source.set_nonblocking(true)?;
     touchpad_source.set_nonblocking(true)?;
+    let mut russian_layout = current_layout_is_russian().unwrap_or(false);
+    set_caps_led(&mut source, russian_layout)?;
     eprintln!(
         "remapping keyboard {} and guarding touchpad clicks from {} ({} ms)",
         path.display(),
@@ -140,6 +143,10 @@ fn run(path: Option<PathBuf>) -> Result<()> {
                 if event.code() == KeyCode::KEY_LEFTMETA.code() {
                     meta_down = event.value() != 0;
                     continue;
+                }
+                if event.code() == KeyCode::KEY_CAPSLOCK.code() && event.value() == 1 {
+                    russian_layout = !russian_layout;
+                    set_caps_led(&mut source, russian_layout)?;
                 }
                 if event.value() == 1 || event.value() == 2 {
                     let modifier = matches!(event.code(),
@@ -185,6 +192,35 @@ fn run(path: Option<PathBuf>) -> Result<()> {
             }
         }
     }
+}
+
+fn current_layout_is_russian() -> Option<bool> {
+    let output = Command::new("niri")
+        .args(["msg", "-j", "keyboard-layouts"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = std::str::from_utf8(&output.stdout).ok()?;
+    let value = text.split("\"current_idx\":").nth(1)?;
+    let index: usize = value
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .ok()?;
+    Some(index == 1)
+}
+
+fn set_caps_led(keyboard: &mut Device, enabled: bool) -> Result<()> {
+    keyboard
+        .send_events(&[
+            InputEvent::new(EventType::LED.0, LedCode::LED_CAPSL.0, i32::from(enabled)),
+            InputEvent::new(EventType::SYNCHRONIZATION.0, 0, 0),
+        ])
+        .context("updating the physical Caps Lock LED")
 }
 
 fn forward_touchpad_frame(
