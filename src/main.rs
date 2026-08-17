@@ -16,6 +16,7 @@ use std::{
 const DEFAULT_DEVICE: &str = "/dev/input/by-path/platform-i8042-serio-0-event-kbd";
 const TOUCHPAD_NAME: &str = "ASUF1209:00 2808:0219 Touchpad";
 const CLICK_GUARD: Duration = Duration::from_millis(250);
+const LAYOUT_SYNC: Duration = Duration::from_millis(500);
 const MT_TOOL_FINGER: i32 = 0;
 const MT_TOOL_PALM: i32 = 2;
 
@@ -116,6 +117,7 @@ fn run(path: Option<PathBuf>) -> Result<()> {
     let mut meta_down = false;
     let mut touchpad_guard = TouchpadGuard::default();
     let mut touchpad_frame = Vec::new();
+    let mut last_layout_sync = Instant::now();
     loop {
         let mut fds = [
             libc::pollfd {
@@ -129,7 +131,7 @@ fn run(path: Option<PathBuf>) -> Result<()> {
                 revents: 0,
             },
         ];
-        let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 250) };
         if ready < 0 {
             return Err(std::io::Error::last_os_error()).context("polling input devices");
         }
@@ -143,10 +145,6 @@ fn run(path: Option<PathBuf>) -> Result<()> {
                 if event.code() == KeyCode::KEY_LEFTMETA.code() {
                     meta_down = event.value() != 0;
                     continue;
-                }
-                if event.code() == KeyCode::KEY_CAPSLOCK.code() && event.value() == 1 {
-                    russian_layout = !russian_layout;
-                    set_caps_led(&mut source, russian_layout)?;
                 }
                 if event.value() == 1 || event.value() == 2 {
                     let modifier = matches!(event.code(),
@@ -190,6 +188,16 @@ fn run(path: Option<PathBuf>) -> Result<()> {
                     touchpad_frame.push(event);
                 }
             }
+        }
+
+        if last_layout_sync.elapsed() >= LAYOUT_SYNC {
+            if let Some(actual_russian) = current_layout_is_russian()
+                && actual_russian != russian_layout
+            {
+                russian_layout = actual_russian;
+                set_caps_led(&mut source, russian_layout)?;
+            }
+            last_layout_sync = Instant::now();
         }
     }
 }

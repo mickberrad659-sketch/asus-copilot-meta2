@@ -10,12 +10,17 @@ trap 'rm -f "$temporary"' EXIT
 xkbcli compile-keymap --layout "$layout" --options "$options" > "$temporary"
 mkdir -p "$(dirname -- "$output")"
 awk '
+  /key <CAPS>/ { in_caps=1 }
+  in_caps && /type= "TWO_LEVEL"/ {
+    sub(/TWO_LEVEL/, "PC_ALT_LEVEL2")
+  }
   /modifier_map Shift/ && !done {
     print "\tkey <FK24> { [ ISO_Level5_Shift ] };"
     print "\tmodifier_map Mod3 { <FK24> };"
     done=1
   }
   { print }
+  in_caps && /^[[:space:]]*};/ { in_caps=0 }
   END { if (!done) exit 42 }
 ' "$temporary" > "$output"
 

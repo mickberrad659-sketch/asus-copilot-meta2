@@ -66,6 +66,8 @@ binds {
 Niri reloads its configuration without logging out. Your existing
 `grp:caps_toggle` switches the default `us,ru` layout. The Caps Lock LED is
 off for English and on for Russian (`grp_led:caps`).
+The generated keymap keeps plain Caps Lock as the layout toggle and moves the
+real capitalization lock to Alt+Caps Lock, without changing the layout LED.
 For another layout, install with environment overrides:
 
 ```bash
