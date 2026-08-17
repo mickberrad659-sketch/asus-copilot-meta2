@@ -19,7 +19,7 @@ sudo udevadm trigger --subsystem-match=input --action=add
 sudo udevadm trigger --subsystem-match=misc --action=add
 
 install -Dm755 "$repo_dir/scripts/build-niri-keymap" "$target_home/.local/bin/asus-copilot-meta2-keymap"
-sudo -u "$target_user" ASUS_META2_LAYOUT="${ASUS_META2_LAYOUT:-us,ru}" ASUS_META2_OPTIONS="${ASUS_META2_OPTIONS:-grp:caps_toggle}" \
+sudo -u "$target_user" ASUS_META2_LAYOUT="${ASUS_META2_LAYOUT:-us,ru}" ASUS_META2_OPTIONS="${ASUS_META2_OPTIONS:-grp:caps_toggle,grp_led:caps}" \
     "$target_home/.local/bin/asus-copilot-meta2-keymap" "$target_home/.config/niri/asus-meta2.xkb"
 
 systemctl --user daemon-reload

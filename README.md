@@ -64,11 +64,12 @@ binds {
 ```
 
 Niri reloads its configuration without logging out. Your existing
-`grp:caps_toggle` layout switch is preserved by the default keymap generator.
+`grp:caps_toggle` switches the default `us,ru` layout. The Caps Lock LED is
+off for English and on for Russian (`grp_led:caps`).
 For another layout, install with environment overrides:
 
 ```bash
-ASUS_META2_LAYOUT="us,de" ASUS_META2_OPTIONS="grp:caps_toggle" ./install.sh
+ASUS_META2_LAYOUT="us,de" ASUS_META2_OPTIONS="grp:caps_toggle,grp_led:caps" ./install.sh
 ```
 
 ## Verify and troubleshoot

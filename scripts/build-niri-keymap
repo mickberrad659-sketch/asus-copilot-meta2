@@ -3,7 +3,7 @@ set -euo pipefail
 
 output=${1:-"$HOME/.config/niri/asus-meta2.xkb"}
 layout=${ASUS_META2_LAYOUT:-us,ru}
-options=${ASUS_META2_OPTIONS:-grp:caps_toggle}
+options=${ASUS_META2_OPTIONS:-grp:caps_toggle,grp_led:caps}
 temporary=$(mktemp)
 trap 'rm -f "$temporary"' EXIT
 
