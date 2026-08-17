@@ -20,8 +20,8 @@ sudo udevadm trigger --subsystem-match=misc --action=add
 
 install -Dm755 "$repo_dir/scripts/build-niri-keymap" "$target_home/.local/bin/asus-copilot-meta2-keymap"
 sudo -u "$target_user" ASUS_META2_LAYOUT="${ASUS_META2_LAYOUT:-us,ru}" ASUS_META2_OPTIONS="${ASUS_META2_OPTIONS:-grp:caps_toggle,grp_led:caps}" \
-    "$target_home/.local/bin/asus-copilot-meta2-keymap" "$target_home/.config/niri/asus-meta2.xkb"
+    "$target_home/.local/bin/asus-copilot-meta2-keymap" "$target_home/.config/niri/asus-meta2-alt-caps.xkb"
 
 systemctl --user daemon-reload
 systemctl --user enable --now asus-copilot-meta2.service
-echo "Installed. For Niri, set keyboard.xkb.file to ~/.config/niri/asus-meta2.xkb"
+echo "Installed. For Niri, set keyboard.xkb.file to ~/.config/niri/asus-meta2-alt-caps.xkb"

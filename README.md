@@ -41,7 +41,7 @@ cd asus-copilot-meta2
 
 The installer builds a release binary, installs a user systemd service, adds
 udev access for the keyboard and `/dev/uinput`, and generates
-`~/.config/niri/asus-meta2.xkb`. It does not overwrite the Niri config.
+`~/.config/niri/asus-meta2-alt-caps.xkb`. It does not overwrite the Niri config.
 
 Use the generated keymap in Niri:
 
@@ -49,7 +49,7 @@ Use the generated keymap in Niri:
 input {
     keyboard {
         xkb {
-            file "~/.config/niri/asus-meta2.xkb"
+            file "~/.config/niri/asus-meta2-alt-caps.xkb"
         }
     }
 }

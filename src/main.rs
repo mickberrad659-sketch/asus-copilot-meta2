@@ -7,16 +7,16 @@ use evdev::{
 use std::{
     collections::HashSet,
     env,
-    os::fd::AsRawFd,
+    io::{BufRead, BufReader, Read, Write},
+    os::{fd::AsRawFd, unix::net::UnixStream},
     path::PathBuf,
-    process::Command,
+    process::{Command, Stdio},
     time::{Duration, Instant},
 };
 
 const DEFAULT_DEVICE: &str = "/dev/input/by-path/platform-i8042-serio-0-event-kbd";
 const TOUCHPAD_NAME: &str = "ASUF1209:00 2808:0219 Touchpad";
 const CLICK_GUARD: Duration = Duration::from_millis(250);
-const LAYOUT_SYNC: Duration = Duration::from_millis(500);
 const MT_TOOL_FINGER: i32 = 0;
 const MT_TOOL_PALM: i32 = 2;
 
@@ -115,9 +115,10 @@ fn run(path: Option<PathBuf>) -> Result<()> {
     let mut filter = CopilotFilter::default();
     let mut last_typing: Option<Instant> = None;
     let mut meta_down = false;
+    let mut alt_down = false;
     let mut touchpad_guard = TouchpadGuard::default();
     let mut touchpad_frame = Vec::new();
-    let mut last_layout_sync = Instant::now();
+    let mut layout_events = spawn_layout_listener()?;
     loop {
         let mut fds = [
             libc::pollfd {
@@ -130,8 +131,13 @@ fn run(path: Option<PathBuf>) -> Result<()> {
                 events: libc::POLLIN,
                 revents: 0,
             },
+            libc::pollfd {
+                fd: layout_events.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
         ];
-        let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 250) };
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
         if ready < 0 {
             return Err(std::io::Error::last_os_error()).context("polling input devices");
         }
@@ -145,6 +151,16 @@ fn run(path: Option<PathBuf>) -> Result<()> {
                 if event.code() == KeyCode::KEY_LEFTMETA.code() {
                     meta_down = event.value() != 0;
                     continue;
+                }
+                if matches!(event.code(),
+                    x if x == KeyCode::KEY_LEFTALT.code()
+                      || x == KeyCode::KEY_RIGHTALT.code())
+                {
+                    alt_down = event.value() != 0;
+                }
+                if event.code() == KeyCode::KEY_CAPSLOCK.code() && event.value() == 1 && !alt_down {
+                    russian_layout = !russian_layout;
+                    set_caps_led(&mut source, russian_layout)?;
                 }
                 if event.value() == 1 || event.value() == 2 {
                     let modifier = matches!(event.code(),
@@ -190,16 +206,68 @@ fn run(path: Option<PathBuf>) -> Result<()> {
             }
         }
 
-        if last_layout_sync.elapsed() >= LAYOUT_SYNC {
-            if let Some(actual_russian) = current_layout_is_russian()
-                && actual_russian != russian_layout
-            {
-                russian_layout = actual_russian;
-                set_caps_led(&mut source, russian_layout)?;
+        if fds[2].revents & libc::POLLIN != 0 {
+            let mut updates = [0_u8; 64];
+            loop {
+                match layout_events.read(&mut updates) {
+                    Ok(0) => bail!("niri layout event stream stopped"),
+                    Ok(count) => {
+                        for value in &updates[..count] {
+                            let actual_russian = *value != 0;
+                            if actual_russian != russian_layout {
+                                russian_layout = actual_russian;
+                                set_caps_led(&mut source, russian_layout)?;
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) => return Err(error).context("reading niri layout events"),
+                }
             }
-            last_layout_sync = Instant::now();
+        }
+        if fds[2].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+            bail!("niri layout event stream disconnected");
         }
     }
+}
+
+fn spawn_layout_listener() -> Result<UnixStream> {
+    let mut child = Command::new("niri")
+        .args(["msg", "--json", "event-stream"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("starting niri layout event stream")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("niri layout event stream has no stdout")?;
+    let (reader, mut writer) = UnixStream::pair().context("creating layout event pipe")?;
+    reader.set_nonblocking(true)?;
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some(russian) = parse_layout_event(&line) {
+                let _ = writer.write_all(&[u8::from(russian)]);
+            }
+        }
+        let _ = child.wait();
+    });
+    Ok(reader)
+}
+
+fn parse_layout_event(line: &str) -> Option<bool> {
+    for marker in ["\"KeyboardLayoutSwitched\":{\"idx\":", "\"current_idx\":"] {
+        if let Some(value) = line.split(marker).nth(1) {
+            let index: usize = value
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .parse()
+                .ok()?;
+            return Some(index == 1);
+        }
+    }
+    None
 }
 
 fn current_layout_is_russian() -> Option<bool> {

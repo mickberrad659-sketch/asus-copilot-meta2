@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-output=${1:-"$HOME/.config/niri/asus-meta2.xkb"}
+output=${1:-"$HOME/.config/niri/asus-meta2-alt-caps.xkb"}
 layout=${ASUS_META2_LAYOUT:-us,ru}
 options=${ASUS_META2_OPTIONS:-grp:caps_toggle,grp_led:caps}
 temporary=$(mktemp)
@@ -10,6 +10,17 @@ trap 'rm -f "$temporary"' EXIT
 xkbcli compile-keymap --layout "$layout" --options "$options" > "$temporary"
 mkdir -p "$(dirname -- "$output")"
 awk '
+  /type "PC_ALT_LEVEL2"/ { in_alt_type=1 }
+  in_alt_type && /modifiers= Alt;/ {
+    sub(/Alt;/, "Shift+Mod1;")
+  }
+  in_alt_type && /map\[Alt\]= 2;/ {
+    print "\t\tmap[Shift]= 1;"
+    print "\t\tmap[Mod1]= 2;"
+    print "\t\tmap[Shift+Mod1]= 2;"
+    next
+  }
+  in_alt_type && /^[[:space:]]*};/ { in_alt_type=0 }
   /key <CAPS>/ { in_caps=1 }
   in_caps && /type= "TWO_LEVEL"/ {
     sub(/TWO_LEVEL/, "PC_ALT_LEVEL2")
