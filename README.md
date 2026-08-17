@@ -10,7 +10,8 @@ On the configured laptop the same input proxy also provides reliable keyboard
 pointer buttons before events reach the compositor:
 
 - `Super+J` is a holdable left button (tap, double-click and drag);
-- `Super+K` is a holdable right button.
+- `Super+K` is a holdable right button;
+- while `Super+N` is held, vertical touchpad motion becomes wheel scrolling.
 
 These combinations suppress Super at the physical input boundary and emit
 buttons through a separate virtual pointer. They never synthesize a Super

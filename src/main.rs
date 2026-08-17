@@ -17,6 +17,8 @@ use std::{
 const DEFAULT_DEVICE: &str = "/dev/input/by-path/platform-i8042-serio-0-event-kbd";
 const TOUCHPAD_NAME: &str = "ASUF1209:00 2808:0219 Touchpad";
 const CLICK_GUARD: Duration = Duration::from_millis(250);
+const SCROLL_UNITS_PER_DETENT: i32 = 64;
+const WHEEL_HI_RES_PER_DETENT: i32 = 120;
 const MT_TOOL_FINGER: i32 = 0;
 const MT_TOOL_PALM: i32 = 2;
 
@@ -82,7 +84,12 @@ fn run(path: Option<PathBuf>) -> Result<()> {
         .build()?;
 
     let pointer_buttons = AttributeSet::from_iter([KeyCode::BTN_LEFT, KeyCode::BTN_RIGHT]);
-    let pointer_axes = AttributeSet::from_iter([RelativeAxisCode::REL_X, RelativeAxisCode::REL_Y]);
+    let pointer_axes = AttributeSet::from_iter([
+        RelativeAxisCode::REL_X,
+        RelativeAxisCode::REL_Y,
+        RelativeAxisCode::REL_WHEEL,
+        RelativeAxisCode::REL_WHEEL_HI_RES,
+    ]);
     let mut pointer = VirtualDevice::builder()
         .context("cannot open /dev/uinput for pointer")?
         .name("ASUS Meta Pointer")
@@ -117,6 +124,8 @@ fn run(path: Option<PathBuf>) -> Result<()> {
     let mut meta_down = false;
     let mut alt_down = false;
     let mut touchpad_guard = TouchpadGuard::default();
+    let mut touchpad_scroller = TouchpadScroller::default();
+    let mut scroll_mode = false;
     let mut touchpad_frame = Vec::new();
     let mut layout_events = spawn_layout_listener()?;
     loop {
@@ -162,21 +171,8 @@ fn run(path: Option<PathBuf>) -> Result<()> {
                     russian_layout = !russian_layout;
                     set_caps_led(&mut source, russian_layout)?;
                 }
-                if event.value() == 1 || event.value() == 2 {
-                    let modifier = matches!(event.code(),
-                        x if x == KeyCode::KEY_LEFTSHIFT.code()
-                          || x == KeyCode::KEY_RIGHTSHIFT.code()
-                          || x == KeyCode::KEY_LEFTCTRL.code()
-                          || x == KeyCode::KEY_RIGHTCTRL.code()
-                          || x == KeyCode::KEY_LEFTALT.code()
-                          || x == KeyCode::KEY_RIGHTALT.code()
-                          || x == KeyCode::KEY_RIGHTMETA.code());
-                    let meta_pointer = meta_down
-                        && matches!(event.code(),
-                        x if x == KeyCode::KEY_J.code() || x == KeyCode::KEY_K.code());
-                    if !modifier && !meta_pointer {
-                        last_typing = Some(Instant::now());
-                    }
+                if counts_as_typing(event, meta_down) {
+                    last_typing = Some(Instant::now());
                 }
             }
             let filtered = filter.frame(frame);
@@ -185,6 +181,9 @@ fn run(path: Option<PathBuf>) -> Result<()> {
             }
             if !filtered.pointer.is_empty() {
                 pointer.emit(&filtered.pointer)?;
+            }
+            if let Some(enabled) = filtered.scroll_mode {
+                scroll_mode = enabled;
             }
         }
 
@@ -195,9 +194,12 @@ fn run(path: Option<PathBuf>) -> Result<()> {
                     if event.code() == 0 {
                         forward_touchpad_frame(
                             &mut touchpad,
+                            &mut pointer,
                             std::mem::take(&mut touchpad_frame),
-                            guarded,
+                            guarded || scroll_mode,
                             &mut touchpad_guard,
+                            scroll_mode,
+                            &mut touchpad_scroller,
                         )?;
                     }
                 } else if event.event_type() != EventType::MISC {
@@ -229,6 +231,20 @@ fn run(path: Option<PathBuf>) -> Result<()> {
             bail!("niri layout event stream disconnected");
         }
     }
+}
+
+fn counts_as_typing(event: &InputEvent, meta_down: bool) -> bool {
+    if meta_down || (event.value() != 1 && event.value() != 2) {
+        return false;
+    }
+    !matches!(event.code(),
+        x if x == KeyCode::KEY_LEFTSHIFT.code()
+          || x == KeyCode::KEY_RIGHTSHIFT.code()
+          || x == KeyCode::KEY_LEFTCTRL.code()
+          || x == KeyCode::KEY_RIGHTCTRL.code()
+          || x == KeyCode::KEY_LEFTALT.code()
+          || x == KeyCode::KEY_RIGHTALT.code()
+          || x == KeyCode::KEY_RIGHTMETA.code())
 }
 
 fn spawn_layout_listener() -> Result<UnixStream> {
@@ -301,10 +317,17 @@ fn set_caps_led(keyboard: &mut Device, enabled: bool) -> Result<()> {
 
 fn forward_touchpad_frame(
     touchpad: &mut VirtualDevice,
+    pointer: &mut VirtualDevice,
     raw: Vec<evdev::InputEvent>,
     guarded: bool,
     guard: &mut TouchpadGuard,
+    scroll_mode: bool,
+    scroller: &mut TouchpadScroller,
 ) -> Result<()> {
+    let wheel = scroller.frame(&raw, scroll_mode);
+    if !wheel.is_empty() {
+        pointer.emit(&wheel)?;
+    }
     let frame = guard.frame(raw, guarded);
     if !frame.is_empty() {
         touchpad.emit(&frame)?;
@@ -315,6 +338,7 @@ fn forward_touchpad_frame(
 #[derive(Default)]
 struct TouchpadGuard {
     current_slot: i32,
+    active_slots: HashSet<i32>,
     palm_slots: HashSet<i32>,
     suppressed_left: bool,
 }
@@ -326,6 +350,19 @@ impl TouchpadGuard {
         let tracking_id = AbsoluteAxisCode::ABS_MT_TRACKING_ID.0;
         let tool_type = AbsoluteAxisCode::ABS_MT_TOOL_TYPE.0;
 
+        if guarded {
+            for active_slot in self.active_slots.clone() {
+                if self.palm_slots.insert(active_slot) {
+                    frame.push(InputEvent::new(EventType::ABSOLUTE.0, slot, active_slot));
+                    frame.push(InputEvent::new(
+                        EventType::ABSOLUTE.0,
+                        tool_type,
+                        MT_TOOL_PALM,
+                    ));
+                }
+            }
+        }
+
         for event in raw {
             if event.event_type() == EventType::ABSOLUTE && event.code() == slot {
                 self.current_slot = event.value();
@@ -334,9 +371,8 @@ impl TouchpadGuard {
             }
             if event.event_type() == EventType::ABSOLUTE && event.code() == tracking_id {
                 if event.value() >= 0 {
-                    // Keep a whole multi-finger gesture inhibited when its
-                    // first contact began inside the 250 ms guard window.
-                    if guarded || !self.palm_slots.is_empty() {
+                    self.active_slots.insert(self.current_slot);
+                    if guarded {
                         self.palm_slots.insert(self.current_slot);
                     }
                     frame.push(event);
@@ -354,6 +390,7 @@ impl TouchpadGuard {
                     ));
                 } else {
                     frame.push(event);
+                    self.active_slots.remove(&self.current_slot);
                     self.palm_slots.remove(&self.current_slot);
                 }
                 continue;
@@ -369,6 +406,21 @@ impl TouchpadGuard {
                 ));
                 continue;
             }
+            if !guarded
+                && event.event_type() == EventType::ABSOLUTE
+                && (event.code() == AbsoluteAxisCode::ABS_MT_POSITION_X.0
+                    || event.code() == AbsoluteAxisCode::ABS_MT_POSITION_Y.0)
+                && self.palm_slots.remove(&self.current_slot)
+            {
+                // Resume an existing contact on its first motion after the
+                // timeout. Waiting for motion avoids turning a bare release
+                // into an accidental tap/click.
+                frame.push(InputEvent::new(
+                    EventType::ABSOLUTE.0,
+                    tool_type,
+                    MT_TOOL_FINGER,
+                ));
+            }
             if event.event_type() == EventType::KEY && event.code() == KeyCode::BTN_LEFT.code() {
                 if event.value() == 1 && guarded {
                     self.suppressed_left = true;
@@ -382,6 +434,78 @@ impl TouchpadGuard {
             frame.push(event);
         }
         frame
+    }
+}
+
+#[derive(Default)]
+struct TouchpadScroller {
+    enabled: bool,
+    touching: bool,
+    last_y: Option<i32>,
+    wheel_units: i32,
+    hi_res_numerator: i32,
+}
+
+impl TouchpadScroller {
+    fn frame(&mut self, raw: &[InputEvent], enabled: bool) -> Vec<InputEvent> {
+        if self.enabled != enabled {
+            self.enabled = enabled;
+            self.last_y = None;
+            self.wheel_units = 0;
+            self.hi_res_numerator = 0;
+        }
+
+        let mut y = None;
+        for event in raw {
+            if event.event_type() == EventType::KEY && event.code() == KeyCode::BTN_TOUCH.code() {
+                self.touching = event.value() != 0;
+            } else if event.event_type() == EventType::ABSOLUTE
+                && event.code() == AbsoluteAxisCode::ABS_Y.0
+            {
+                y = Some(event.value());
+            }
+        }
+
+        if !enabled || !self.touching {
+            self.last_y = None;
+            return Vec::new();
+        }
+        let Some(y) = y else {
+            return Vec::new();
+        };
+        let Some(previous_y) = self.last_y.replace(y) else {
+            return Vec::new();
+        };
+        let delta = y - previous_y;
+        if delta == 0 || delta.abs() > 512 {
+            return Vec::new();
+        }
+
+        // Linux wheel values are positive for up. Finger motion down therefore
+        // becomes a negative wheel delta, matching ordinary two-finger scroll.
+        self.wheel_units -= delta;
+        self.hi_res_numerator -= delta * WHEEL_HI_RES_PER_DETENT;
+        let wheel = self.wheel_units / SCROLL_UNITS_PER_DETENT;
+        let hi_res = self.hi_res_numerator / SCROLL_UNITS_PER_DETENT;
+        self.wheel_units %= SCROLL_UNITS_PER_DETENT;
+        self.hi_res_numerator %= SCROLL_UNITS_PER_DETENT;
+
+        let mut output = Vec::with_capacity(2);
+        if wheel != 0 {
+            output.push(InputEvent::new(
+                EventType::RELATIVE.0,
+                RelativeAxisCode::REL_WHEEL.0,
+                wheel,
+            ));
+        }
+        if hi_res != 0 {
+            output.push(InputEvent::new(
+                EventType::RELATIVE.0,
+                RelativeAxisCode::REL_WHEEL_HI_RES.0,
+                hi_res,
+            ));
+        }
+        output
     }
 }
 
@@ -438,12 +562,58 @@ mod touchpad_tests {
     }
 
     #[test]
+    fn guarded_contact_resumes_on_motion_without_being_lifted() {
+        let mut guard = TouchpadGuard::default();
+        guard.frame(vec![abs(AbsoluteAxisCode::ABS_MT_TRACKING_ID, 1)], true);
+        let resumed = guard.frame(vec![abs(AbsoluteAxisCode::ABS_MT_POSITION_Y, 1200)], false);
+        assert_eq!(resumed.len(), 2);
+        assert_eq!(resumed[0].code(), AbsoluteAxisCode::ABS_MT_TOOL_TYPE.0);
+        assert_eq!(resumed[0].value(), MT_TOOL_FINGER);
+        assert_eq!(resumed[1].code(), AbsoluteAxisCode::ABS_MT_POSITION_Y.0);
+        assert!(guard.palm_slots.is_empty());
+        assert!(guard.active_slots.contains(&0));
+    }
+
+    #[test]
+    fn super_shortcuts_do_not_count_as_typing() {
+        let h = InputEvent::new(EventType::KEY.0, KeyCode::KEY_H.code(), 1);
+        assert!(!counts_as_typing(&h, true));
+        assert!(counts_as_typing(&h, false));
+    }
+
+    #[test]
     fn physical_click_press_and_release_are_suppressed_as_a_pair() {
         let mut guard = TouchpadGuard::default();
         let down = InputEvent::new(EventType::KEY.0, KeyCode::BTN_LEFT.code(), 1);
         let up = InputEvent::new(EventType::KEY.0, KeyCode::BTN_LEFT.code(), 0);
         assert!(guard.frame(vec![down], true).is_empty());
         assert!(guard.frame(vec![up], false).is_empty());
+    }
+
+    #[test]
+    fn scroll_mode_converts_downward_touch_motion_to_wheel_down() {
+        let mut scroller = TouchpadScroller::default();
+        let touch = |value| InputEvent::new(EventType::KEY.0, KeyCode::BTN_TOUCH.code(), value);
+        assert!(
+            scroller
+                .frame(&[touch(1), abs(AbsoluteAxisCode::ABS_Y, 1000)], true,)
+                .is_empty()
+        );
+        let wheel = scroller.frame(&[abs(AbsoluteAxisCode::ABS_Y, 1064)], true);
+        assert_eq!(wheel[0].code(), RelativeAxisCode::REL_WHEEL.0);
+        assert_eq!(wheel[0].value(), -1);
+        assert_eq!(wheel[1].code(), RelativeAxisCode::REL_WHEEL_HI_RES.0);
+        assert_eq!(wheel[1].value(), -120);
+    }
+
+    #[test]
+    fn scroll_mode_converts_upward_touch_motion_to_wheel_up() {
+        let mut scroller = TouchpadScroller::default();
+        let touch = InputEvent::new(EventType::KEY.0, KeyCode::BTN_TOUCH.code(), 1);
+        scroller.frame(&[touch, abs(AbsoluteAxisCode::ABS_Y, 1000)], true);
+        let wheel = scroller.frame(&[abs(AbsoluteAxisCode::ABS_Y, 936)], true);
+        assert_eq!(wheel[0].value(), 1);
+        assert_eq!(wheel[1].value(), 120);
     }
 }
 
